@@ -1,0 +1,566 @@
+---
+title: "Processing"
+output: html_document
+date: "2023-09-21"
+---
+
+
+```{r}
+knitr::opts_chunk$set(echo = TRUE)
+source("./_scripts/0_0_Libraries.R")
+```
+
+
+### -Utils
+
+```{r}
+source(file = "./_scripts/0_1_DownloadUtils.R")
+```
+
+### -Auth Token request
+
+```{r}
+## Run once
+# token <- POST("https://www.warcraftlogs.com/oauth/token",
+#           config = list(),
+#           body = list(
+#             grant_type="client_credentials",
+#             client_id=Sys.getenv("client_id"),
+#             client_secret=Sys.getenv("client_secret")))
+# 
+# token <- content(token,"parsed")
+# 
+# Manually copy token to .env file and load locally
+```
+
+```{r}
+token <- Sys.getenv("TOKEN")
+
+#url <- "https://classic.warcraftlogs.com/api/v2"
+url <- "https://sod.warcraftlogs.com/api/v2"
+
+WCL_API2_request <- function(request) {
+  
+  tryCatch({
+    
+    request <- jsonlite::toJSON(list(query=request),
+                                auto_unbox=TRUE,
+                                bigint_as_char=F)
+    
+    
+    response <- POST(url,
+                     add_headers("Content-Type" = "application/json",
+                                 "Authorization"= paste0("Bearer ",
+                                                         token)),
+                     body = request,
+                     content_type_json(),
+                     encode = "json")
+    
+    response_formated <- fromJSON(content(response,
+                                          as = "text",
+                                          encoding="UTF-8"),
+                                  bigint_as_char=TRUE)
+    
+    return(response_formated)
+  }, error = function(e) {
+    # Handle the error here or return an informative message
+    cat("Error in WCL_API2_request:", e$message, " Request: ",request,"\n")
+    return(NULL)  # Return an appropriate value or error indicator
+  })
+}
+
+```
+
+## Download  log data
+
+# Get data
+
+## + Logs IDs
+
+```{r}
+request_logs_code <- sprintf(request_logs_str,2008, 1:25)
+
+response_logs_code <- lapply(seq_along(request_logs_code), function(i) {  
+  
+  response <- WCL_API2_request(request_logs_code[i]
+  )$data$reportData$reports$data
+  
+  if (i %% 5 == 0) {
+    cat("Processed", i, "out of", length(request_logs_code), "\n")
+  }
+  
+  return(response)
+})
+
+response_logs_code_df <- do.call(rbind, response_logs_code)
+
+write.csv(response_logs_code_df,paste0("response_logs_code_df_Gnomer_",format(Sys.time(), "%Y_%m_%d_h%H_m%M"),".csv"))
+```
+
+
+# Encounter Data
+
+
+```{r}
+
+logIDs <- unique(response_logs_code_df$code)
+
+request_encounter <- sprintf(request_encounter_str, logIDs)
+
+
+response_formatted_list <- lapply(seq_along(request_encounter), function(i) {  
+  
+  response <- WCL_API2_request(request_encounter[i])$data$reportData$report$fights 
+  
+  if (i %% 50 == 0) {
+    cat("Processed", i, "out of", length(request_encounter), "\n")
+  }
+  
+  if(!is.null(response) & length(response)>0) {
+    
+    response <- mutate(response, 
+                       duration = endTime - startTime,  
+                       duration_s = duration/1000,
+                       logID = as.character(logIDs[i])
+    )
+    
+    response <- rename(response,fightID = id)
+    
+  } else {
+    response <- data.frame(logID = character(0),
+                           fightID=integer(0),
+                           encounterID=integer(0),
+                           difficulty =integer(0),
+                           hardModeLevel =integer(0),
+                           averageItemLevel =integer(0),
+                           size =integer(0),
+                           kill =character(0),
+                           lastPhase =integer(0),
+                           startTime=integer(0) ,
+                           endTime =integer(0),
+                           fightPercentage=integer(0) ,
+                           bossPercentage=integer(0) ,
+                           completeRaid =character(0),
+                           
+                           duration=integer(0)  ,
+                           duration_s=integer(0) 
+                           
+    )
+  }
+  return(response)
+})
+
+encounter_response_list<- response_formatted_list
+rm(response_formatted_list)
+encounter_data <- do.call(rbind, encounter_response_list)
+
+write.csv(encounter_data,paste0("./encounter_data_Gnomer_",format(Sys.time(), "%Y_%m_%d_h%H_m%M"),".csv"))
+
+```
+
+
+```{r}
+encounter_data_mechanical <- encounter_data %>% filter(encounterID %in% c(2927,2899,2935,2940)) 
+
+
+dismantle_dmg_query <- '{
+    reportData {
+        report(code: "%s") {
+            events(dataType:DamageDone
+                  killType:Encounters
+                  hostilityType:Friendlies
+                  fightIDs:%i
+                  startTime: 0
+                  endTime: 999999999999
+                  includeResources: true
+                  filterExpression:"%s"){
+              data
+              nextPageTimestamp
+              }
+            }
+        }
+        }'
+
+
+
+Dismantle <-"ability.id in (439164)"
+
+
+df_select <- encounter_data_mechanical  %>%
+  select(logID,fightID) 
+
+#### -balancection Initial specs
+request_logs_code <- sprintf(dismantle_dmg_query,
+                             df_select$logID,
+                             df_select$fightID,
+                             Dismantle)
+
+request_logs_code <- request_logs_code
+
+n_total <- length(request_logs_code)
+
+
+output <- lapply(seq_along(request_logs_code), function(i) {  
+  
+  
+  response <- WCL_API2_request(request_logs_code[i]
+  )$data$reportData$report$events$data
+  
+  if (!is.null(response) & length(response)>0) {
+    response <- response %>%
+      mutate(logID =  as.character(encounter_data_mechanical$logID[i]),
+             fightID = as.integer(encounter_data_mechanical$fightID[i]),
+             size = as.integer(encounter_data_mechanical$size[i]),
+             difficulty = as.integer(encounter_data_mechanical$difficulty[i]),
+             kill = as.integer(encounter_data_mechanical$kill[i]),
+             startTime = as.integer(encounter_data_mechanical$startTime[i]),
+             duration_s = as.integer(encounter_data_mechanical$duration_s[i]),
+             averageItemLevel = as.character(encounter_data_mechanical$averageItemLevel[i]),
+             fightPercentage = as.character(encounter_data_mechanical$fightPercentage[i])
+             
+      )
+  } else {
+    response <- data.frame(timestamp=-1,
+                           logID = as.character(encounter_data_mechanical$logID[i]),
+                           fightID = as.integer(encounter_data_mechanical$fightID[i]),
+                           size = as.integer(encounter_data_mechanical$size[i]),
+                           difficulty = as.integer(encounter_data_mechanical$size[i]),
+                           kill = as.integer(encounter_data_mechanical$kill[i]),
+                           startTime = as.integer(encounter_data_mechanical$startTime[i]),
+                           duration_s = as.integer(encounter_data_mechanical$duration_s[i]),
+                           averageItemLevel = as.character(encounter_data_mechanical$averageItemLevel[i]),
+                           fightPercentage = as.character(encounter_data_mechanical$fightPercentage[i])
+    )
+  }
+  
+  if (i %% 100 == 0) {
+    cat("Processed encounter",i, "out of", n_total,"Dismantle Encounters\n")
+  }
+  
+  return(response)
+})
+
+output2 <- do.call(bind_rows, output)
+
+saveRDS(output2,paste0("./Dismantle_rawdata_Gnomer_",format(Sys.time(), "%Y_%m_%d_h%H_m%M"),".RData"))
+
+df_dismantle <- readRDS("./Dismantle_rawdata_Gnomer_2024_03_01_h18_m34.RData")
+
+```
+
+
+
+
+```{r}
+dismantle_player_query <- '{
+    reportData {
+        report(code: "%s") {
+            masterData(translate: true) {
+                actors(type: "player"){
+          
+                gameID
+                id
+                name
+                server
+                subType
+                
+                }
+        }
+    }
+}}'
+
+
+player_filter_dismantle <- df_dismantle %>% filter(timestamp != -1) %>% group_by(logID) %>% summarise(n = n())
+
+request_player <- sprintf(dismantle_player_query,  player_filter_dismantle$logID)
+
+
+#request_player <- request_player [1:100]
+
+response_formatted_list <- lapply(seq_along(request_player), function(i) {  
+  
+  response <- WCL_API2_request(request_player[i])$data$reportData$report$masterData$actors
+  
+  if (i %% 50 == 0) {
+    cat("Processed", i, "out of", length(request_player), "\n")
+  }
+  
+  if(!is.null(response) & length(response)>0) {
+    
+    response <- mutate(response,
+                       logID =as.character(player_filter_dismantle$logID[i])
+    )
+    
+  } else {
+    response <- data.frame(logID = as.character(player_filter_dismantle$logID[i])
+                           
+    )
+  }
+  return(response)
+})
+
+
+dismantle_players <- do.call(bind_rows, response_formatted_list)
+
+
+saveRDS(dismantle_players,paste0("./Dismantle_rawdata_players_Gnomer_",format(Sys.time(), "%Y_%m_%d_h%H_m%M"),".RData"))
+
+```
+
+
+
+```{r}
+df_dismantle %>% filter(hitType==1)%>% arrange(desc(amount))
+dismantle_players
+
+
+final_dismantle_set_df <- df_dismantle %>% 
+  
+  filter(timestamp!=-1 & kill == 1) %>%
+  
+  group_by(logID,fight,sourceID,duration_s) %>%
+  
+  summarise(n=n(), amount=mean(amount)) %>% 
+  
+  left_join(dismantle_players %>% 
+              select(id,logID,subType) %>%
+              filter(subType != "Unknown"), 
+            by=c(sourceID="id","logID")) %>% ungroup() %>%
+  
+  mutate(cast_every_secs = duration_s/n,
+         duration_m = duration_s/60,
+         cast_per_m = n/duration_m)
+
+final_dismantle_set_df
+
+final_dismantle_set_df %>%
+  group_by(subType) %>%
+  summarise(min_s=min(cast_every_secs),
+            max_s=max(cast_every_secs),
+            mean_s=mean(cast_every_secs),
+            median_s=median(cast_every_secs),
+            median_min=mean(cast_per_m),
+            dmg_mean = mean(amount)) %>%
+  arrange(median_min) %>%
+  ungroup()
+
+```
+
+
+
+```{r}
+final_dismantle_set_df %>% group_by(logID,sourceID) %>% summarise(n=n())
+final_dismantle_set_df %>% group_by(logID,fight) %>% summarise(n=n())
+final_dismantle_set_df %>% group_by(logID) %>% summarise(n=n())
+
+```
+
+```{r}
+plot_dismantle <- final_dismantle_set_df %>%
+  group_by(subType) %>%
+  summarise(min_s=min(cast_every_secs),
+            max_s=max(cast_every_secs),
+            mean_s=mean(cast_every_secs),
+            median_s=median(cast_every_secs),
+            median_min=mean(cast_per_m)) %>%
+  arrange(median_min) %>%
+  ungroup() %>%
+  
+  ggplot(aes(x = reorder(subType,-median_min), 
+             y = median_min,
+             color = reorder(subType,-median_min),
+             label = round(median_min,digits=1))) +
+  
+
+  geom_hline(yintercept=3, linetype="dashed",size=0.25,alpha=0.75) +
+  geom_hline(yintercept=15, linetype="dashed",size=0.25,alpha=0.75) +
+  geom_hline(yintercept=9, linetype="dotted",size=0.25,alpha=0.75)+
+  geom_hline(yintercept=6 ,size=0.15,alpha=0.75)+
+  geom_hline(yintercept=12,size=0.15,alpha=0.75) +
+  
+  geom_segment(aes(x = reorder(subType,-median_min), xend = reorder(subType,-median_min), 
+                   y = 0, yend = median_min), size=1.5) +
+  geom_point(size=5) +
+  
+  labs(title="&#35; Dismantle procs for each class",y= "Procs per minute", x= "Class",
+       caption=c("<p><span style='font-family:forgefooter'>&#xe900;</span> &emsp; discord.gg/wp55kqmyYG - Discfordge &#91;Vivax-Pagle(US)&#93;"," <br> <span style='font-family:forgefooter'>&#xe901;</span> https:&#47;&#47;www&#46;github.com/ForgeGit/SOD_Dismantle</p>"),
+       subtitle="Data from: 2,103 logs containing 7,758 mechanical bosses and 6,178 characters") +
+  
+  scale_color_manual(values=c("#FFF468", "#AAD372", "#0070DD", "#C69B6D", "#F48CBA", "#FF7C0A", "#3FC7EB", "#cffbff", "#8788EE"))+ 
+  scale_fill_manual(values=c("#FFF468", "#AAD372", "#0070DD", "#C69B6D", "#F48CBA", "#FF7C0A", "#3FC7EB", "#cffbff", "#8788EE"))+ 
+  guides(color="none",fill="none") +
+  
+  vivax_theme() +
+  
+  scale_y_continuous(limits = c(0,16),
+                     breaks = seq(3,15,3),
+                     expand = c(0,0)) + 
+  #geom_text(hjust=0, vjust=-0.75, color="black",size=15) + 
+ geom_label(aes(fill = reorder(subType,-median_min)),color = "grey23", fontface = "bold",size=15)
+
+
+
+plot_dismantle
+
+#ggsave("./plot_dismantle.png",plot_dismantle, 
+#       width = 6, height =3.7,units="in",device = "png",dpi=300)
+
+ggsave("./plot_dismantle_4.png",plot_dismantle, 
+       width = 6, height =3.7,units="in",device = "png",dpi=300)
+
+
+
+```
+
+
+
+
+
+
+## -Utils 
+
+```{r}
+scale_factor = 2.65
+
+# ` variable name `     |n      or | or \ Symbol on Keyboard
+#"forge-"    
+#e901 github
+#e900 discord
+font_add(family = "forgefooter", "forgefooter.ttf")
+font_import()
+n
+showtext_auto(TRUE)
+```
+
+## -Themes
+
+```{r}
+scale_factor = 2.65
+
+vivax_theme <- function() {
+  theme_bw() +
+    
+    theme(axis.title.x = element_text(size = scale_factor * 13),
+          axis.title.y = element_text(size = scale_factor * 13),
+          plot.title = element_markdown(face = "bold",
+                                        size = scale_factor * 16,
+                                        hjust = 0, 
+                                        margin = margin(b = 0.25)),
+          plot.subtitle = element_markdown(face="italic",
+                                           size = scale_factor * 12,
+                                           lineheight=0.5, 
+                                        margin = margin(b = 0.5)),
+          plot.caption = element_markdown(face = "italic",
+                                          hjust = 0,
+                                          vjust=1,
+                                          size = scale_factor * 8,
+                                          lineheight=0.3,
+                                          margin = margin(t = 1, unit = "pt")),
+          legend.position = c(0.26, 0.8),
+          legend.spacing.x = unit(1, "pt"),
+          legend.spacing.y = unit(0.5, "pt"),
+          legend.direction="horizontal",
+          legend.box.just = "left",
+          legend.title = element_text(size=scale_factor*13),
+          legend.text = element_text(size = scale_factor * 11,
+                                     lineheight=0.5),
+          #  legend.background = element_rect(fill = "transparent"),
+          axis.text = element_markdown(size= scale_factor * 10),
+          strip.text.x = element_text(size = scale_factor * 12),
+          legend.background = element_rect(fill = alpha('white', 0.4)),
+          axis.text.x = element_markdown(size= scale_factor * 10,
+                                         angle=0,hjust=0.5,
+                                         margin = margin(t = -1, unit = "pt")),
+          panel.grid.major = element_blank(),
+          panel.grid.minor = element_blank()
+    )
+}
+
+vivax_theme_title <- function() {
+  theme_bw() +
+    
+    theme(axis.title.x = element_text(size = scale_factor * 13),
+          axis.title.y = element_text(size = scale_factor * 13),
+          plot.title = element_markdown(face = "bold",
+                                        size = scale_factor * 17,
+                                        hjust = 0,
+                                        lineheight=0.3),
+          plot.subtitle = element_markdown(face="italic",
+                                           size = scale_factor * 13,
+                                           lineheight=0.3),
+          plot.caption = element_markdown(face = "italic",
+                                          hjust = 0,
+                                          vjust=1,
+                                          size = scale_factor * 8,
+                                          lineheight=c(0.5,0,0.75),
+                                          margin = margin(t = -10, unit = "pt")),
+          legend.position = c(0.26, 0.8),
+          legend.spacing.x = unit(1, "pt"),
+          legend.spacing.y = unit(0.5, "pt"),
+          legend.direction="horizontal",
+          legend.box.just = "left",
+          legend.title = element_text(size=scale_factor*13),
+          legend.text = element_text(size = scale_factor * 11,
+                                     lineheight=0.5),
+          #  legend.background = element_rect(fill = "transparent"),
+          axis.text = element_markdown(size= scale_factor * 10),
+          strip.text.x = element_text(size = scale_factor * 12),
+          legend.background = element_rect(fill = alpha('white', 0.4)),
+          axis.text.x = element_markdown(size= scale_factor * 10,
+                                         angle=45,hjust=1,
+                                          margin = margin(t = -1, unit = "pt"))
+          )
+}
+
+
+
+vivax_theme_v3 <- function() {
+  theme_bw() +
+    
+    theme(axis.title.x = element_text(size = scale_factor * 13),
+          axis.title.y = element_text(size = scale_factor * 13),
+          plot.title = element_markdown(face = "bold",
+                                        size = scale_factor * 16,
+                                        hjust = 0, 
+                                        margin = margin(b = 0.5)),
+          plot.subtitle = element_markdown(face="italic",
+                                           size = scale_factor * 12,
+                                           lineheight=0.3, 
+                                        margin = margin(b = 0.5)),
+          plot.caption = element_markdown(face = "italic",
+                                          hjust = 0,
+                                          vjust=1,
+                                          size = scale_factor * 8,
+                                          lineheight=0.3,
+                                          margin = margin(t = -10, unit = "pt")),
+          legend.position = c(0.26, 0.8),
+          legend.spacing.x = unit(1, "pt"),
+          legend.spacing.y = unit(0.5, "pt"),
+          legend.direction="horizontal",
+          legend.box.just = "left",
+          legend.title = element_text(size=scale_factor*13),
+          legend.text = element_text(size = scale_factor * 11,
+                                     lineheight=0.5),
+          #  legend.background = element_rect(fill = "transparent"),
+          axis.text = element_markdown(size= scale_factor * 10),
+          strip.text.x = element_text(size = scale_factor * 12),
+          legend.background = element_rect(fill = alpha('white', 0.4)),
+          axis.text.x = element_markdown(size= scale_factor * 10,
+                                         angle=45,hjust=1,
+                                         margin = margin(t = -1, unit = "pt")),
+          axis.text.y = element_markdown(size= scale_factor * 10),
+          panel.grid.major = element_blank(),
+          panel.grid.minor = element_blank()
+    )
+}
+
+```
+
+
+
+
+
+
+
+
+
